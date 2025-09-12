@@ -1,2 +1,4 @@
 # TradingView-bot-Phase3
-Phase3 
+```bash
+Phase3 Incomplete
+```
