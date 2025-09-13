@@ -1,10 +1,10 @@
 //@version=6
-indicator("Candle-Reader Dashboard - Phase 3 (Fixed maps & ta.* consistency)", overlay=true, max_labels_count=500, max_lines_count=500)
+indicator("Candle-Reader Dashboard - Phase 3 (State Machine, Stable)", overlay=true, max_labels_count=500, max_lines_count=500)
 
-// ===================== USER INPUTS =====================
+// -------------------- INPUTS --------------------
 tablePos       = input.string("Top Right", "Table Position", options=["Top Left","Top Right","Bottom Left","Bottom Right"])
 tfList         = input.string("5,15,60", "Timeframes (comma-separated)")
-historyLength  = input.int(5, "History Length", minval=1, maxval=10)
+historyLength  = input.int(5, "History Length", minval=1, maxval=20)
 showMarkers    = input.bool(true, "Show Chart Markers")
 showMarkersChartOnly = input.bool(true, "Only show markers for chart's TF")
 showLabels     = input.bool(true, "Show Marker Labels (L/S/Exit)")
@@ -54,8 +54,9 @@ T_exit    = T_entry - 2 * Delta
 requireTrend = input.bool(true, "Require trend alignment for entries (EMA fast > slow)")
 entryConfirmBars = input.int(2, "Confirm entry after N bars", minval=1, maxval=10)
 minBarsBetweenSignals = input.int(2, "Min bars between opposite signals (flip guard)", minval=0, maxval=200)
+confExitThreshold = input.int(30, "Confidence threshold to force exit (percent)")
 
-// ===================== PATTERN DETECTION =====================
+// -------------------- PATTERN DETECTORS --------------------
 detectPattern(o,h,l,c) =>
     body = math.abs(c - o)
     upperW = h - math.max(c,o)
@@ -90,7 +91,7 @@ detectInside(h1,l1,h2,l2) =>
     inside = (h2 < h1) and (l2 > l1)
     [inside ? "Inside" : "", 0]
 
-// ===================== SAFE histPush =====================
+// -------------------- SAFE histPush --------------------
 histPush(histStored, newTok) =>
     arr = array.new_string(0)
     if str.length(histStored) > 0
@@ -114,8 +115,8 @@ histPush(histStored, newTok) =>
             display := display == "" ? t : display + " → " + t
     [stored, display]
 
-// ===================== MAP HELPERS (defensive) =====================
-// string map for history
+// -------------------- MAP HELPERS (defensive) --------------------
+// history map
 var map_keys = array.new_string(0)
 var map_vals = array.new_string(0)
 if barstate.isfirst
@@ -145,7 +146,7 @@ map_get(k) =>
                 break
     res
 
-// float map for prev score
+// prev-score float map
 var f_keys = array.new_string(0)
 var f_vals = array.new_float(0)
 if barstate.isfirst
@@ -175,7 +176,7 @@ map_get_float(k) =>
                 break
     res
 
-// int maps (pending counters) - fully defensive
+// pending counters (int)
 var int_keys_L = array.new_string(0)
 var int_vals_L = array.new_int(0)
 var int_keys_S = array.new_string(0)
@@ -205,7 +206,6 @@ map_get_int(keysArr, valsArr, k) =>
     if sz > 0
         for ii = 0 to sz - 1
             if array.get(keysArr, ii) == k
-                // ensure valsArr has same size before get
                 if array.size(valsArr) > ii
                     res := array.get(valsArr, ii)
                 break
@@ -257,13 +257,44 @@ map_get_lastsig_type(k) =>
                 break
     res
 
-// ===================== TABLE INIT =====================
+// state map (0=flat, 1=long, -1=short)
+var state_keys = array.new_string(0)
+var state_vals = array.new_int(0)
+if barstate.isfirst
+    array.clear(state_keys)
+    array.clear(state_vals)
+
+map_set_state(k, v) =>
+    found = false
+    sz = array.size(state_keys)
+    if sz > 0
+        for ii = 0 to sz - 1
+            if array.get(state_keys, ii) == k
+                array.set(state_vals, ii, v)
+                found := true
+                break
+    if not found
+        array.push(state_keys, k)
+        array.push(state_vals, v)
+
+map_get_state(k) =>
+    res = 0
+    sz = array.size(state_keys)
+    if sz > 0
+        for ii = 0 to sz - 1
+            if array.get(state_keys, ii) == k
+                if array.size(state_vals) > ii
+                    res := array.get(state_vals, ii)
+                break
+    res
+
+// -------------------- TABLE INIT --------------------
 pos = tablePos == "Top Left" ? position.top_left : tablePos == "Top Right" ? position.top_right : tablePos == "Bottom Left" ? position.bottom_left : position.bottom_right
-var table dashTable = table.new(position=pos, columns=6, rows=30, border_width=1)
+var table dashTable = table.new(position=pos, columns=6, rows=40, border_width=1)
 if barstate.isfirst
     table.cell(dashTable, 0, 0, "DEBUG", bgcolor=color.orange, text_color=color.black)
 
-// ===================== SR Anchors (safe requests) =====================
+// -------------------- SR ANCHORS (safe requests) --------------------
 anchors = str.split(srAnchorsStr, ",")
 anchorA = array.size(anchors) > 0 ? str.trim(array.get(anchors, 0)) : ""
 anchorB = array.size(anchors) > 1 ? str.trim(array.get(anchors, 1)) : ""
@@ -297,7 +328,7 @@ if not na(pl3)
     array.push(levels, pl3)
     array.push(types, -1)
 
-// ===================== MAIN LOOP =====================
+// -------------------- MAIN LOOP --------------------
 tfs = str.split(tfList, ",")
 row = 1
 
@@ -306,42 +337,37 @@ for tf in tfs
     if str.length(tf_str) == 0
         continue
 
-    // MTF bundle - single security call per TF (consistent)
+    // MTF bundle (single request per TF)
     [o,h,l,c,vol,o1,h1,l1,c1] = request.security(syminfo.tickerid, tf_str, [open, high, low, close, volume, open[1], high[1], low[1], close[1]], lookahead=barmerge.lookahead_off)
 
-    // Patterns
+    // patterns
     [pat1, dir1] = detectPattern(o,h,l,c)
     [patE, dirE] = detectEngulfing(o1,h1,l1,c1,o,h,l,c)
     [patI, dirI] = detectInside(h1,l1,h,l)
     patFinal = patE != "" ? patE : (patI != "" ? patI : pat1)
     candleScore = patE != "" ? dirE : (patI != "" ? 0 : dir1)
 
-    // ============ ALL TA.* CALCULATIONS (UNCONDITIONAL) ============
-    // MACD
+    // ===== all ta.* calculations (unconditional) =====
     macdLine = ta.ema(c, fastMACD) - ta.ema(c, slowMACD)
     macdSig  = ta.ema(macdLine, sigMACD)
     macdVal  = macdLine > macdSig ? +1 : macdLine < macdSig ? -1 : 0
 
-    // RSI
     rsiRaw = ta.rsi(c, rsiLen)
     rsiVal = rsiRaw >= rsiBull ? +1 : rsiRaw <= rsiBear ? -1 : 0
 
-    // Volume
     volSMA = ta.sma(vol, volLen)
     volVal = vol > volSMA ? +1 : -1
 
-    // Trend EMAs
     trFast = ta.ema(c, emaFast)
     trSlow = ta.ema(c, emaSlow)
     trendVal = trFast > trSlow ? +1 : -1
 
-    // ATR
     atrNow = ta.atr(atrLen)
     atrSmoothVar = ta.sma(atrNow, atrSmooth)
     atrRatio = atrNow / (atrSmoothVar + 1e-10)
     atrVal = (atrRatio > hardHigh or atrRatio < hardLow) ? 0 : (atrRatio >= sweetMin and atrRatio <= sweetMax ? +1 : 0)
 
-    // SR score (nearest pivot normalized by ATR) - baseATR computed unconditionally
+    // SR scoring
     srVal = 0
     baseATR = ta.atr(atrLen) + 1e-10
     if array.size(levels) > 0
@@ -363,7 +389,7 @@ for tf in tfs
             else if localBest <= srRetestPct
                 srVal := 0
 
-    // gate by toggles
+    // gate toggles
     macdScore = useMACD ? macdVal : 0
     rsiScore  = useRSI ? rsiVal : 0
     volScore  = useVOL ? volVal : 0
@@ -371,17 +397,16 @@ for tf in tfs
     atrScore  = useATR ? atrVal : 0
     srScore   = useSR ? srVal : 0
 
-    // N-of-M core
+    // core and weighted score
     corePass = (macdScore != 0 ? 1 : 0) + (rsiScore != 0 ? 1 : 0) + (volScore != 0 ? 1 : 0)
     nOfMok = corePass >= 2
 
-    // Weighted score & confidence
     score = wCandle * candleScore + wMACD * macdScore + wRSI * rsiScore + wVOL * volScore + wTREND * trendScore + wSR * srScore + wATR * atrScore
     sumWeights = wCandle + wMACD + wRSI + wVOL + wTREND + wSR + wATR
     conf = sumWeights > 0 ? math.round(100 * (score + sumWeights) / (2 * sumWeights)) : 50
     conf_val = conf < 0 ? 0 : conf > 100 ? 100 : conf
 
-    // ---------- SIGNAL HARDENING (robust & relaxed to ensure signals fire) ----------
+    // ---------- SIGNAL HARDENING (pending counters/confirm) ----------
     prevScore = map_get_float(tf_str)
 
     rawLong = nOfMok and (score >= T_entry)
@@ -393,58 +418,77 @@ for tf in tfs
     curLongCnt = map_get_int(int_keys_L, int_vals_L, tf_str)
     curShortCnt = map_get_int(int_keys_S, int_vals_S, tf_str)
 
-    // increment or reset pending counters (defensive)
     curLongCnt := (rawLong and trendOkLong) ? curLongCnt + 1 : 0
     curShortCnt := (rawShort and trendOkShort) ? curShortCnt + 1 : 0
 
     map_set_int(int_keys_L, int_vals_L, tf_str, curLongCnt)
     map_set_int(int_keys_S, int_vals_S, tf_str, curShortCnt)
 
+    // last signal spacing guard
     lastBar = map_get_lastsig_bar(tf_str)
     lastType = map_get_lastsig_type(tf_str)
     barsSinceLast = (lastBar < 0) ? 999999 : (bar_index - lastBar)
 
-    state = "Monitoring"
+    // confirmedSignal indicates candidate confirmed by pending count (still not the held-state machine)
     confirmedSignal = 0
-
-    // confirm long if pending reached (allow minimum 1)
     if curLongCnt >= math.max(1, entryConfirmBars)
         if barsSinceLast >= minBarsBetweenSignals or lastType != 1
             confirmedSignal := 1
-            state := "Entry Long"
-            map_set_lastsig(tf_str, bar_index, +1)
-
-    // confirm short
     if curShortCnt >= math.max(1, entryConfirmBars)
         if barsSinceLast >= minBarsBetweenSignals or lastType != -1
             confirmedSignal := -1
-            state := "Entry Short"
+
+    // ---------- STATE MACHINE (per TF) ----------------
+    prevState = map_get_state(tf_str)  // 0 flat, 1 long, -1 short
+    newState = prevState
+    emitSignal = 0  // 1=long entry, -1=short entry, 2=exit
+
+    // Entry transitions (only when candidate confirmed and not already in same state)
+    if confirmedSignal == 1 and prevState != 1
+        // allow entry if trend ok and spacing ok
+        if (trendOkLong) and (barsSinceLast >= minBarsBetweenSignals or lastType != 1)
+            newState := 1
+            emitSignal := 1
+            // register last signal
+            map_set_lastsig(tf_str, bar_index, +1)
+
+    if confirmedSignal == -1 and prevState != -1
+        if (trendOkShort) and (barsSinceLast >= minBarsBetweenSignals or lastType != -1)
+            newState := -1
+            emitSignal := -1
             map_set_lastsig(tf_str, bar_index, -1)
 
-    if confirmedSignal == 0
-        if nOfMok
-            if score > T_hold
-                state := "Long Running"
-            else if score < -T_hold
-                state := "Short Running"
-            else if math.abs(score) <= T_exit
-                state := "Exit"
-        else
-            state := "Blocked"
+    // Exit conditions while holding
+    // Long held -> exit when score drops below T_exit OR opposite confirmed OR confidence collapse
+    if newState == 1
+        longExitCond = (score <= T_exit) or (curShortCnt >= math.max(1, entryConfirmBars)) or (conf_val <= confExitThreshold)
+        if longExitCond
+            newState := 0
+            emitSignal := 2  // exit
 
-    if confirmedSignal != 0
-        // optionally could create alerts here via alertcondition()
-        na
+    // Short held -> exit when score rises above -T_exit OR opposite confirmed OR confidence collapse
+    if newState == -1
+        shortExitCond = (score >= -T_exit) or (curLongCnt >= math.max(1, entryConfirmBars)) or (conf_val <= confExitThreshold)
+        if shortExitCond
+            newState := 0
+            emitSignal := 2  // exit
 
-    // persist current score for next bar checks
+    // persist new state
+    if newState != prevState
+        map_set_state(tf_str, newState)
+
+    // update prevScore for next bar
     map_set_float(tf_str, score)
 
-    // history safe push
+    // history push (safe)
     prevStored = map_get(tf_str)
     [newStored, displayHist] = histPush(prevStored, patFinal)
     map_set(tf_str, newStored)
 
-    // table & tooltips
+    // table state display
+    state_display = newState == 1 ? "Long (Held)" : newState == -1 ? "Short (Held)" : (curLongCnt > 0 ? "Pending L (" + str.tostring(curLongCnt) + ")" :  curShortCnt > 0 ? "Pending S (" + str.tostring(curShortCnt) + ")" : (nOfMok ? (math.abs(score) > T_hold ? (score > 0 ? "Long Running" : "Short Running") : "Monitoring") : "Blocked") )
+
+    // tooltips & table writes
     tt_hist = "History (→ newest): " + displayHist
     tt_current = "Pattern: " + patFinal
     tt_filters = "MACD:" + str.tostring(macdScore) + " RSI:" + str.tostring(rsiScore) + " VOL:" + str.tostring(volScore) + " SR:" + str.tostring(srScore)
@@ -453,19 +497,21 @@ for tf in tfs
     table.cell(dashTable, 0, row, tf_str, bgcolor=color.gray, text_color=color.white)
     table.cell(dashTable, 1, row, displayHist, tooltip = tt_hist)
     table.cell(dashTable, 2, row, patFinal, tooltip = tt_current)
-    table.cell(dashTable, 3, row, state, tooltip = tt_signal)
+    table.cell(dashTable, 3, row, state_display, tooltip = tt_signal)
     table.cell(dashTable, 4, row, tt_filters, tooltip = tt_filters)
     bgC = conf_val >= 85 ? color.new(color.green, 60) : conf_val >= 70 ? color.new(color.green, 80) : conf_val >= 40 ? color.new(color.yellow, 80) : color.new(color.red, 80)
     table.cell(dashTable, 5, row, str.tostring(conf_val) + "%", bgcolor = bgC)
 
-    // markers - only for confirmed signals
-    if showMarkers and confirmedSignal != 0 and barstate.isconfirmed
+    // Plot labels only on transition events (emitSignal) and confirmed exit
+    if showMarkers and emitSignal != 0 and barstate.isconfirmed
         showHere = (not showMarkersChartOnly) or (tf_str == timeframe.period)
         if showHere
-            if confirmedSignal == 1
+            if emitSignal == 1
                 label.new(bar_index, low, "▲" + (showLabels ? " L" : ""), style=label.style_label_up, color=color.green, textcolor=color.white, yloc=yloc.belowbar, size=size.small)
-            else
+            else if emitSignal == -1
                 label.new(bar_index, high, "▼" + (showLabels ? " S" : ""), style=label.style_label_down, color=color.red, textcolor=color.white, yloc=yloc.abovebar, size=size.small)
+            else if emitSignal == 2
+                label.new(bar_index, close, "■" + (showLabels ? " Exit" : ""), style=label.style_label_center, color=color.gray, textcolor=color.white, yloc=yloc.price, size=size.small)
 
     row := row + 1
 
@@ -476,3 +522,4 @@ table.cell(dashTable, 2, row, "PivL/R:" + str.tostring(pivotLeft) + "/" + str.to
 table.cell(dashTable, 3, row, "Weights C/M/R:" + str.tostring(wCandle) + "/" + str.tostring(wMACD) + "/" + str.tostring(wRSI))
 table.cell(dashTable, 4, row, "SRW:" + str.tostring(wSR))
 table.cell(dashTable, 5, row, " ")
+
