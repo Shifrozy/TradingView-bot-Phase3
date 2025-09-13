@@ -1,5 +1,5 @@
 // @version=6
-indicator("Candle-Reader Dashboard - Phase 3 (Advanced SR)", overlay=true, max_labels_count=500, max_lines_count=500)
+indicator("Candle-Reader Dashboard - Phase 3 (Final Fixed v2)", overlay=true, max_labels_count=500, max_lines_count=500)
 
 // ===================== USER INPUTS =====================
 tablePos       = input.string("Top Right", "Table Position", options=["Top Left","Top Right","Bottom Left","Bottom Right"])
@@ -8,7 +8,7 @@ historyLength  = input.int(5, "History Length", minval=3, maxval=10)
 showMarkers    = input.bool(true, "Show Chart Markers")
 showLabels     = input.bool(true, "Show Marker Labels (L/S/Exit)")
 
-// Filters toggles (carried from Phase 2)
+// Filters toggles
 useMACD   = input.bool(true, "Use MACD")
 useRSI    = input.bool(true, "Use RSI")
 useVOL    = input.bool(true, "Use Volume")
@@ -33,7 +33,7 @@ sweetMax  = input.float(1.5, "ATR Sweet Max")
 hardLow   = input.float(0.6, "ATR Hard Low")
 hardHigh  = input.float(2.2, "ATR Hard High")
 
-// SR anchor TFs (relative to chart TF)
+// SR anchor TFs
 srAnchorsStr = input.string("15,30,60", "SR Anchor TFs (comma-separated)")
 pivotLeft    = input.int(15, "Pivot Left Width")
 pivotRight   = input.int(15, "Pivot Right Width")
@@ -56,15 +56,7 @@ Delta     = input.float(0.4, "Hysteresis Delta")
 T_hold    = T_entry - Delta
 T_exit    = T_entry - 2 * Delta
 
-// Visual settings
-confGreen = color.new(color.green, 70)
-confYellow = color.new(color.yellow, 70)
-confRed = color.new(color.red, 70)
-
-// ===================== UTILITIES & PATTERNS (PHASE1/2 CARIED) =====================
-isBullish(o,c) => c > o
-isBearish(o,c) => c < o
-
+// ===================== PATTERN DETECTION =====================
 detectPattern(o,h,l,c) =>
     body     = math.abs(c - o)
     upperW   = h - math.max(c,o)
@@ -77,12 +69,12 @@ detectPattern(o,h,l,c) =>
         pattern := "Doji"
         dir := 0
     else if bodyPct > 0.9
-        pattern := c > o ? "Maru(B)" : "Maru(S)"
+        pattern := c > o ? "MaruB" : "MaruS"
         dir := c > o ? +1 : -1
-    else if lowerW > 2 * body and upperW < body
+    else if (lowerW > 2 * body) and (upperW < body)
         pattern := "Hammer"
         dir := +1
-    else if upperW > 2 * body and lowerW < body
+    else if (upperW > 2 * body) and (lowerW < body)
         pattern := "Shooting"
         dir := -1
     else if bodyPct < 0.3
@@ -99,7 +91,7 @@ detectInside(h1,l1,h2,l2) =>
     inside = (h2 < h1) and (l2 > l1)
     [inside ? "Inside" : "", 0]
 
-// Filters (Phase 2)
+// ===================== FILTERS =====================
 calcRSI(src,len) =>
     r = ta.rsi(src, len)
     r >= rsiBull ? +1 : r <= rsiBear ? -1 : 0
@@ -118,149 +110,23 @@ calcTREND(c) =>
     s = ta.ema(c, emaSlow)
     f > s ? +1 : -1
 
-calcATRratio(src) =>
+calcATRratio() =>
     a = ta.atr(atrLen)
     smooth = ta.sma(a, atrSmooth)
     ratio = a / (smooth + 1e-10)
-    ratio > hardHigh or ratio < hardLow ? 0 : ratio >= sweetMin and ratio <= sweetMax ? +1 : 0
+    (ratio > hardHigh or ratio < hardLow) ? 0 : (ratio >= sweetMin and ratio <= sweetMax ? +1 : 0)
 
-// ===================== TABLE SETUP =====================
-cols = 6 // TF | History | Current | Signal | Status | Confidence
-var dashTable = table.new( position = tablePos == "Top Left" ? position.top_left : tablePos == "Top Right" ? position.top_right : tablePos == "Bottom Left" ? position.bottom_left : position.bottom_right, columns = cols, rows = 100, border_width=1)
+// ===================== TABLE =====================
+pos = tablePos == "Top Left" ? position.top_left : tablePos == "Top Right" ? position.top_right : tablePos == "Bottom Left" ? position.bottom_left : position.bottom_right
+var table dashTable = table.new(position=pos, columns=6, rows=100, border_width=1)
 
-// Helper to build short history string
-histPush(hist, s) =>
-    // hist is a string with comma-separated short codes (rightmost newest)
-    parts = str.split(hist, ",")
-    arr = array.new_string()
-    // push existing into array
-    for i = 0 to array.size(parts)-1
-        part = str.trim(parts[i])
-        if str.len(part) > 0
-            array.push(arr, part)
-    // append new
-    array.push(arr, s)
-    // keep only last historyLength
-    while array.size(arr) > historyLength
-        array.shift(arr)
-    // join with arrow
-    out = ""
-    for i = 0 to array.size(arr)-1
-        out := out == "" ? array.get(arr, i) : out + " → " + array.get(arr, i)
-    out
+// ===================== HISTORY MAP =====================
+var string_map_keys = array.new_string(0)
+var string_map_vals = array.new_string(0)
 
-// ===================== ADVANCED MULTI-ANCHOR SR SYSTEM =====================
-// We'll request for each anchor TF a bundle: pivot highs & lows (boolean), pivot price, ATR on anchor TF
-// To optimize, we pack arrays into a single request return per anchor TF.
-
-// Parse anchor TFs
-anchors = str.split(srAnchorsStr, ",")
-anchor_count = array.size(anchors)
-
-// SR detection per anchor: use ta.pivothigh/pivotlow on that TF with left/right widths (as integers)
-// We'll create functions to request anchor data and compute S/R levels list (recent pivots only)
-
-type SRLevel
-// We'll emulate a small struct via tuples in arrays: [price, type(1=resistance,-1=support), tf_str, bar_index_of_pivot]
-
-// Function to fetch pivot highs/lows for a given anchor TF
-getAnchorSR(tf_str) =>
-    // request in one call: high/low series needed for pivots + ATR for tolerance
-    // on the anchor TF we compute arrays of recent pivot prices and their bar_index (local to anchor) and then return as series via string-encoded compressed format
-    // Pine cannot directly return arrays from request.security; instead, return the most-recent pivot values and their offsets and rely on repeated calls over time to gather history.
-    // We will return a tuple: [lastPivotHighPrice, lastPivotHighIndexOffset, lastPivotLowPrice, lastPivotLowIndexOffset, anchorATR]
-    ph = ta.pivothigh(high, pivotLeft, pivotRight)
-    pl = ta.pivotlow(low, pivotLeft, pivotRight)
-    // When a pivot is detected, ph/pl contains the pivot value at the bar where pivot completed; on other bars it's na.
-    anchor_atr = ta.atr(atrLen)
-    // We return these native series; request.security will align them to chart TF.
-    [ph, ph ? bar_index : na, pl, pl ? bar_index : na, anchor_atr]
-
-// Wrapper to call request.security for each anchor and extract values
-// We'll compute SRscore by checking current chart close against nearest SR zones from all anchors.
-getAllAnchorsSR() =>
-    totalSRlevels = array.new_float()
-    totalSRtypes = array.new_int()
-    totalSRtf = array.new_string()
-    totalSRidx = array.new_int()
-    // iterate anchors and request each
-    for i = 0 to anchor_count - 1
-        tf_raw = str.trim(array.get(anchors, i))
-        // safety skip empty
-        if str.len(tf_raw) == 0
-            continue
-        // request anchor outputs (in one call)
-        [ph, ph_idx, pl, pl_idx, atr_val] = request.security(syminfo.tickerid, tf_raw, getAnchorSR(tf_raw), lookahead=barmerge.lookahead_off)
-        // add pivot high if present
-        if not na(ph)
-            array.push(totalSRlevels, ph)
-            array.push(totalSRtypes, 1) // resistance
-            array.push(totalSRtf, tf_raw)
-            array.push(totalSRidx, ph_idx)
-        // add pivot low if present
-        if not na(pl)
-            array.push(totalSRlevels, pl)
-            array.push(totalSRtypes, -1) // support
-            array.push(totalSRtf, tf_raw)
-            array.push(totalSRidx, pl_idx)
-    [totalSRlevels, totalSRtypes, totalSRtf, totalSRidx]
-
-// Compute SRscore using ATR tolerance per anchor: nearest SR level wins.
-// We compute distance_in_price / anchorATR and compare with srNearPct, srBreakPct, srRetestPct.
-// SRscore logic per brief: +1 supportive, 0 neutral, -1 blocking
-computeSRscore(levelsArr, typesArr, tfArr, idxArr) =>
-    // default neutral
-    scoreSR = 0
-    bestAbs = 1e12
-    bestType = 0
-    // We'll use current chart's ATR (on chart TF) for normalization to be consistent with table visibility
-    baseATR = ta.atr(atrLen)
-    // iterate all collected SR levels
-    for j = 0 to array.size(levelsArr)-1
-        lvl = array.get(levelsArr, j)
-        typ = array.get(typesArr, j)
-        // distance relative to current price
-        if not na(lvl)
-            dist = math.abs(close - lvl)
-            // normalize with baseATR (avoid zero)
-            norm = dist / (baseATR + 1e-10)
-            // decide zone: Near (<= srNearPct*ATR), Break (< srBreakPct*ATR), Retest (<= srRetestPct*ATR)
-            // We'll pick the most relevant (smallest norm)
-            if norm < bestAbs
-                bestAbs := norm
-                bestType := typ
-    // Map bestAbs to score
-    if bestAbs <= srNearPct
-        // Near: supportive if it's a support and price above it (bullish), or resistance and price below it (bearish)
-        if bestType == -1 and close > array.size(levelsArr) ? 0 : 0
-            scoreSR := +1
-        else if bestType == 1 and close < array.size(levelsArr) ? 0 : 0
-            scoreSR := -1
-        else
-            scoreSR := 0
-    else if bestAbs <= srRetestPct
-        // Retest zone considered neutral-to-supportive depending on polarity
-        if bestType == -1 and close > lvl
-            scoreSR := +1
-        else if bestType == 1 and close < lvl
-            scoreSR := -1
-        else
-            scoreSR := 0
-    else
-        scoreSR := 0
-    scoreSR
-
-// ===================== MAIN LOOP (MTF Rows + SR integration) =====================
-tfs = str.split(tfList, ",")
-row = 0
-
-// State persistence for history per TF (map TF->string)
-var string_map_keys = array.new_string()
-var string_map_vals = array.new_string()
-map_set = (k, v) =>
-    // simple map emulation: if exists, update, else push
+map_set(k, v) =>
     found = false
-    for ii = 0 to array.size(string_map_keys)-1
+    for ii = 0 to array.size(string_map_keys) - 1
         if array.get(string_map_keys, ii) == k
             array.set(string_map_vals, ii, v)
             found := true
@@ -269,74 +135,125 @@ map_set = (k, v) =>
         array.push(string_map_keys, k)
         array.push(string_map_vals, v)
 
-map_get = (k) =>
-    for ii = 0 to array.size(string_map_keys)-1
+map_get(k) =>
+    res = ""
+    for ii = 0 to array.size(string_map_keys) - 1
         if array.get(string_map_keys, ii) == k
-            return array.get(string_map_vals, ii)
-    ""
+            res := array.get(string_map_vals, ii)
+            break
+    res
 
+histPush(hist, s) =>
+    parts = str.split(hist, ",")
+    arr = array.new_string(0)
+    for i = 0 to array.size(parts) - 1
+        part = str.trim(array.get(parts, i))
+        if str.length(part) > 0
+            array.push(arr, part)
+    array.push(arr, s)
+    while array.size(arr) > historyLength
+        array.shift(arr)
+    out = ""
+    for i = 0 to array.size(arr) - 1
+        out := out == "" ? array.get(arr, i) : out + " → " + array.get(arr, i)
+    out
 
-// Precompute SR across anchors once per chart bar
-[allLevels, allTypes, allTFs, allIdx] = getAllAnchorsSR()
+// ===================== SR ANCHORS (explicit calls) =====================
+anchors = str.split(srAnchorsStr, ",")
+anchorA = array.size(anchors) > 0 ? str.trim(array.get(anchors, 0)) : ""
+anchorB = array.size(anchors) > 1 ? str.trim(array.get(anchors, 1)) : ""
+anchorC = array.size(anchors) > 2 ? str.trim(array.get(anchors, 2)) : ""
+
+// call request.security once per anchor (safe)
+ph1 = anchorA != "" ? request.security(syminfo.tickerid, anchorA, ta.pivothigh(high, pivotLeft, pivotRight), lookahead=barmerge.lookahead_off) : na
+pl1 = anchorA != "" ? request.security(syminfo.tickerid, anchorA, ta.pivotlow(low, pivotLeft, pivotRight), lookahead=barmerge.lookahead_off) : na
+ph2 = anchorB != "" ? request.security(syminfo.tickerid, anchorB, ta.pivothigh(high, pivotLeft, pivotRight), lookahead=barmerge.lookahead_off) : na
+pl2 = anchorB != "" ? request.security(syminfo.tickerid, anchorB, ta.pivotlow(low, pivotLeft, pivotRight), lookahead=barmerge.lookahead_off) : na
+ph3 = anchorC != "" ? request.security(syminfo.tickerid, anchorC, ta.pivothigh(high, pivotLeft, pivotRight), lookahead=barmerge.lookahead_off) : na
+pl3 = anchorC != "" ? request.security(syminfo.tickerid, anchorC, ta.pivotlow(low, pivotLeft, pivotRight), lookahead=barmerge.lookahead_off) : na
+
+levels = array.new_float(0)
+types  = array.new_int(0)
+if not na(ph1)
+    array.push(levels, ph1)
+    array.push(types, 1)
+if not na(pl1)
+    array.push(levels, pl1)
+    array.push(types, -1)
+if not na(ph2)
+    array.push(levels, ph2)
+    array.push(types, 1)
+if not na(pl2)
+    array.push(levels, pl2)
+    array.push(types, -1)
+if not na(ph3)
+    array.push(levels, ph3)
+    array.push(types, 1)
+if not na(pl3)
+    array.push(levels, pl3)
+    array.push(types, -1)
+
+computeSRscore(levelsArr, typesArr, atrLenLocal) =>
+    if array.size(levelsArr) == 0
+        0
+    else
+        float baseATR = ta.atr(atrLenLocal) + 1e-10
+        float bestNorm = 1e12
+        int bestType = 0
+        for j = 0 to array.size(levelsArr) - 1
+            lvl = array.get(levelsArr, j)
+            typ = array.get(typesArr, j)
+            if not na(lvl)
+                norm = math.abs(close - lvl) / baseATR
+                if norm < bestNorm
+                    bestNorm := norm
+                    bestType := typ
+        if bestNorm == 1e12
+            0
+        else
+            if bestNorm <= srBreakPct
+                bestType == -1 ? +1 : -1
+            else if bestNorm <= srNearPct
+                bestType == -1 ? +1 : -1
+            else if bestNorm <= srRetestPct
+                0
+            else
+                0
+
+// ===================== MAIN LOOP =====================
+tfs = str.split(tfList, ",")
+row = 0
 
 for tf in tfs
     tf_str = str.trim(tf)
-    if str.len(tf_str) == 0
+    if str.length(tf_str) == 0
         continue
 
-    // bundle candle + vol via one request per TF (optimized)
-    fetchTF() =>
-        [o_, h_, l_, c_, v_] = [open, high, low, close, volume]
-        [o1_, h1_, l1_, c1_] = [open[1], high[1], low[1], close[1]]
-        [o_, h_, l_, c_, v_, o1_, h1_, l1_, c1_]
+    // direct tuple passed to request.security (no arrow function)
+    [o,h,l,c,vol,o1,h1,l1,c1] = request.security(syminfo.tickerid, tf_str, [open, high, low, close, volume, open[1], high[1], low[1], close[1]], lookahead=barmerge.lookahead_off)
 
-    [o,h,l,c,vol,o1,h1,l1,c1] = request.security(syminfo.tickerid, tf_str, fetchTF(), lookahead=barmerge.lookahead_off)
-
-    // Patterns
     [pat1, dir1] = detectPattern(o,h,l,c)
     [patE, dirE] = detectEngulfing(o1,h1,l1,c1,o,h,l,c)
     [patI, dirI] = detectInside(h1,l1,h,l)
-    patFinal = patE != "" ? patE : patI != "" ? patI : pat1
-    dirCandle = patE != "" ? dirE : patI != "" ? 0 : dir1
+    patFinal = patE != "" ? patE : (patI != "" ? patI : pat1)
+    dirCandle = patE != "" ? dirE : (patI != "" ? 0 : dir1)
     candleScore = dirCandle
 
-    // Filter scores (run on that TF values we fetched)
     macdScore = useMACD ? calcMACD(c) : 0
     rsiScore  = useRSI ? calcRSI(c, rsiLen) : 0
     volScore  = useVOL ? calcVOL(vol) : 0
     trendScore= useTREND ? calcTREND(c) : 0
-    atrScore  = useATR ? calcATRratio(c) : 0
+    atrScore  = useATR ? calcATRratio() : 0
+    srScore   = useSR ? computeSRscore(levels, types, atrLen) : 0
 
-    // SRscore (use precomputed anchor pivot list)
-    srScore = 0
-    if useSR
-        srScore := computeSRscore(allLevels, allTypes, allTFs, allIdx)
-    else
-        srScore := 0
-
-    // N-of-M among MACD/RSI/Vol (non-zero counts as pass)
-    corePass = 0
-    corePass += (macdScore != 0) ? 1 : 0
-    corePass += (rsiScore != 0) ? 1 : 0
-    corePass += (volScore != 0) ? 1 : 0
+    corePass = (macdScore != 0 ? 1 : 0) + (rsiScore != 0 ? 1 : 0) + (volScore != 0 ? 1 : 0)
     nOfMok = corePass >= 2
 
-    // Weighted score
     score = wCandle * candleScore + wMACD * macdScore + wRSI * rsiScore + wVOL * volScore + wTREND * trendScore + wSR * srScore + wATR * atrScore
-
-    // Map score to confidence percentage (example scaling)
-    // We normalize across possible weight bounds: min = -sum(weights), max = +sum(weights)
     sumWeights = wCandle + wMACD + wRSI + wVOL + wTREND + wSR + wATR
-    maxScore = sumWeights
-    minScore = -sumWeights
-    conf = 0.0
-    if maxScore - minScore > 0
-        conf := math.round(100 * (score - minScore) / (maxScore - minScore))
-        conf := math.min(math.max(conf, 0), 100)
-    else
-        conf := 50
+    conf = sumWeights > 0 ? math.round(100 * (score + sumWeights) / (2 * sumWeights)) : 50
+    conf := conf < 0 ? 0 : conf > 100 ? 100 : conf
 
-    // Signal & Status (with hysteresis thresholds)
     state = "Monitoring"
     if nOfMok
         if score >= T_entry
@@ -349,67 +266,31 @@ for tf in tfs
             state := "Short Running"
         else if math.abs(score) <= T_exit
             state := "Exit"
-        else
-            state := "Monitoring"
     else
         state := "Blocked"
 
-    // Build history (persisted per TF)
     shortCode = patFinal == "" ? "—" : patFinal
     prevHist = map_get(tf_str)
     newHist = histPush(prevHist, shortCode)
     map_set(tf_str, newHist)
 
-    // Tooltips
-    tt_hist = "History (new → right): " + newHist
-    tt_current = "Current pattern: " + patFinal + " (dir: " + (dirCandle==1 ? "Bull" : dirCandle==-1 ? "Bear" : "Neutral") + ")"
-    tt_filters = "Filters:\nMACD:" + str.tostring(macdScore) + " RSI:" + str.tostring(rsiScore) + " Vol:" + str.tostring(volScore) + " Trend:" + str.tostring(trendScore) + " ATR:" + str.tostring(atrScore) + " SR:" + str.tostring(srScore)
-    tt_signal = "Score: " + str.tostring(score) + "\nConf: " + str.tostring(conf) + "%\nN-of-M pass: " + (nOfMok ? "Yes" : "No")
-    tt_status = "State: " + state
-
-    // Table write (columns: TF | History | Current | Signal | Status | Confidence)
+    // Table write
     table.cell(dashTable, 0, row, tf_str, bgcolor=color.gray, text_color=color.white)
-    table.cell(dashTable, 1, row, newHist, tooltip = tt_hist)
-    table.cell(dashTable, 2, row, patFinal, tooltip = tt_current)
-    table.cell(dashTable, 3, row, state, tooltip = tt_signal)
-    table.cell(dashTable, 4, row, tt_filters, tooltip = tt_filters)
-    // Confidence coloring
-    confBg = conf >= 85 ? color.new(color.green, 60) : conf >= 70 ? color.new(color.green, 80) : conf >= 40 ? color.new(color.yellow, 80) : color.new(color.red, 80)
-    table.cell(dashTable, 5, row, str.tostring(conf) + "%", bgcolor = confBg)
+    table.cell(dashTable, 1, row, newHist)
+    table.cell(dashTable, 2, row, patFinal)
+    table.cell(dashTable, 3, row, state)
+    table.cell(dashTable, 4, row, "Score " + str.tostring(score))
+    bgC = conf >= 85 ? color.new(color.green, 60) : conf >= 70 ? color.new(color.green, 80) : conf >= 40 ? color.new(color.yellow, 80) : color.new(color.red, 80)
+    table.cell(dashTable, 5, row, str.tostring(conf) + "%", bgcolor=bgC)
 
-    // Chart Markers: only on confirmed bars (no repaint) and for chart TF (we place markers on chart bar index when the TF row equals the current chart TF)
-    // If the TF equals chart timeframe, we place markers on the confirmed bar with positional offsets handled safely.
     if showMarkers and barstate.isconfirmed
-        // safe check: if this tf_str equals the resolution of the chart, place marker on current bar. 
-        // Note: request.security aligned series only update on anchor bar closes; we choose to place on chart when TF matches or always place on current confirmed close as indicative.
         if state == "Entry Long"
-            lbl = label.new(bar_index, low, "▲" + (showLabels ? " L" : ""), style=label.style_label_up, color=color.green, textcolor=color.white, yloc=yloc.belowbar, size=size.small)
+            label.new(bar_index, low, "▲" + (showLabels ? " L" : ""), style=label.style_label_up, color=color.green, textcolor=color.white, yloc=yloc.belowbar, size=size.small)
         else if state == "Entry Short"
-            lbl = label.new(bar_index, high, "▼" + (showLabels ? " S" : ""), style=label.style_label_down, color=color.red, textcolor=color.white, yloc=yloc.abovebar, size=size.small)
+            label.new(bar_index, high, "▼" + (showLabels ? " S" : ""), style=label.style_label_down, color=color.red, textcolor=color.white, yloc=yloc.abovebar, size=size.small)
         else if state == "Exit"
-            lbl = label.new(bar_index, close, "■" + (showLabels ? " Exit" : ""), style=label.style_label_center, color=color.gray, textcolor=color.white, yloc=yloc.price, size=size.small)
-        // labels are persistent by default until chart limit; TradingView will cap at max_labels_count if too many appear.
+            label.new(bar_index, close, "■" + (showLabels ? " Exit" : ""), style=label.style_label_center, color=color.gray, textcolor=color.white, yloc=yloc.price, size=size.small)
 
     row += 1
 
-// End loop
-
-// Small footer row indicating config
-rowFooter = row
-table.cell(dashTable, 0, rowFooter, "Config", bgcolor=color.silver)
-table.cell(dashTable, 1, rowFooter, "Anchors: " + srAnchorsStr)
-table.cell(dashTable, 2, rowFooter, "Piv L/R: " + str.tostring(pivotLeft) + "/" + str.tostring(pivotRight))
-table.cell(dashTable, 3, rowFooter, "Weights: C" + str.tostring(wCandle) + " M" + str.tostring(wMACD) + " R" + str.tostring(wRSI))
-table.cell(dashTable, 4, rowFooter, "SR W:" + str.tostring(wSR))
-table.cell(dashTable, 5, rowFooter, " ")
-
-
 // ===================== END =====================
-// Notes:
-// - This Phase 3 adds an advanced multi-anchor SR approach using pivots on anchor TFs.
-// - SRscore picks nearest pivot across anchors and applies ATR-based proximity rules.
-// - Tooltips in table cells provide breakdowns for quick inspection.
-// - All request.security calls use lookahead_off and patterns run on closed bars only.
-// - If you want more aggressive SR logic (store many pivot levels per anchor or draw SR lines),
-//   we can extend the anchor collector to return historical arrays and plot persistent SR lines.
-// - Tell me if you want SR lines drawn, different SR scoring behavior, or further UI compression.
